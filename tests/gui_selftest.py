@@ -3,8 +3,9 @@
     py tests\\gui_selftest.py [--timing-log full_run.csv]
 
 Opens the auto-typer, drives it through the scenarios below and prints PASS or
-FAIL for each check. It takes about two minutes. Don't touch the keyboard or
-mouse while it runs: the app will (correctly) treat that as a focus change.
+FAIL for each check. It also opens classic Notepad as an external target. It
+takes about two minutes. Don't touch the keyboard or mouse while it runs: the
+app will (correctly) treat that as a focus change.
 Exit code: 0 = all passed, 1 = a check failed, 2 = could not get the foreground.
 """
 
@@ -39,6 +40,8 @@ SAMPLE = (
 )
 MEDIUM = "Interference test: the caret is moved and the slider is clicked mid-run, ok? 😊 done.\n"
 LONG = "the quick brown fox jumps over the lazy dog " * 20
+NOTEPAD_TEXT = ("Notepad test: café, é, 😊 👍🏽 " + FAMILY + " 🇺🇸 1️⃣ @#%+ done.\n"
+                "\tTabbed line.  Two spaces.\nLast line. ")
 
 THIEF_TITLE = "Auto-typer self-test: focus thief"
 THIEF = f"""
@@ -56,34 +59,41 @@ r.mainloop()
 """
 
 _user32 = ctypes.WinDLL("user32", use_last_error=True)
-_kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-_user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
-_user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
 _user32.FindWindowW.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR)
 _user32.FindWindowW.restype = wintypes.HWND
 _user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+_user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
 _user32.GetClipboardOwner.restype = wintypes.HWND
-_kernel32.OpenProcess.restype = wintypes.HANDLE
-_kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
-                                                 ctypes.POINTER(wintypes.DWORD))
+_ENUM_PROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+_user32.EnumWindows.argtypes = (_ENUM_PROC, wintypes.LPARAM)
 
 
 def describe_window(hwnd: int) -> str:
     """Title and executable of a window, to explain an unexpected focus change."""
     if not hwnd:
         return "no foreground window"
-    title = ctypes.create_unicode_buffer(256)
-    _user32.GetWindowTextW(hwnd, title, 256)
-    pid = wintypes.DWORD()
-    _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-    exe = "?"
-    handle = _kernel32.OpenProcess(0x1000, False, pid.value)  # PROCESS_QUERY_LIMITED_INFORMATION
-    if handle:
-        buf, size = ctypes.create_unicode_buffer(512), wintypes.DWORD(512)
-        if _kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
-            exe = os.path.basename(buf.value)
-        _kernel32.CloseHandle(handle)
-    return f"{title.value!r} ({exe}, pid {pid.value})"
+    _, pid = wi.window_thread_process(hwnd)
+    return f"{wi.window_title(hwnd)!r} ({wi.process_name(pid)}, pid {pid})"
+
+
+def find_window(pid: int, class_name: str) -> int:
+    found: list[int] = []
+
+    def callback(hwnd, _lparam):
+        if wi.window_thread_process(hwnd)[1] == pid and wi.class_name(hwnd) == class_name:
+            found.append(hwnd)
+            return False
+        return True
+
+    _user32.EnumWindows(_ENUM_PROC(callback), 0)
+    return found[0] if found else 0
+
+
+def hold_key(root: tk.Tk, vk: int, ms: int = 80) -> None:
+    """Press and release a key the way a person does (held for `ms`)."""
+    scan = wi.user32.MapVirtualKeyW(vk, 0)
+    wi._send([wi._key(vk, scan, 0)])
+    root.after(ms, lambda: wi._send([wi._key(vk, scan, wi.KEYEVENTF_KEYUP)]))
 
 
 class Harness:
@@ -92,36 +102,50 @@ class Harness:
         self.root = tk.Tk()
         self.app = autotyper.AutoTyperApp(self.root, seed=20261117)
         self.app.run_ended_hook = self._run_ended
+        self.confirmations: list[str] = []
+        self.app._confirm_special_keys = lambda text: self.confirmations.append(text) or True
         self.timing_log = timing_log
         self.results: list[tuple[str, bool, str]] = []
         self.clipboard_start = wi.clipboard_sequence_number()
         self.thief: subprocess.Popen | None = None
+        self.notepad: subprocess.Popen | None = None
+        self.notepad_hwnd = 0
+        self.editor_before = ""
         self.scenario: dict | None = None
         self.beats: list[float] = []
         self.beat_info: list[str] = []
         self.exit_code = 0
+        stop = self.check_stopped
         self.scenarios = [
-            dict(name="Full run, corrections on, 150 WPM", text=SAMPLE, wpm=150, corrections=True,
+            dict(name="Full run, corrections on, 90 WPM", text=SAMPLE, wpm=90, corrections=True,
                  heartbeat=True, log=True, check=self.check_full_run),
-            dict(name="Corrections off, 200 WPM", text=SAMPLE.split("\n\n\n")[0], wpm=200,
+            dict(name="Corrections off, 120 WPM", text=SAMPLE.split("\n\n\n")[0], wpm=120,
                  corrections=False, check=self.check_corrections_off),
-            dict(name="Caret moved and slider clicked mid-run", text=MEDIUM, wpm=120, corrections=True,
+            dict(name="Caret moved and slider dragged mid-run", text=MEDIUM, wpm=80, corrections=True,
                  actions=[(15, self.move_caret), (30, self.click_slider)], check=self.check_interference),
-            dict(name="Stop button", text=LONG, wpm=200, corrections=True,
+            dict(name="Stop button", text=LONG, wpm=120, corrections=True,
                  actions=[(25, lambda: self.app.stop_button.invoke())],
-                 check=lambda run, text: self.check_stopped(run, text, "Stop button")),
-            dict(name="Escape key (real keystroke via SendInput)", text=LONG, wpm=200, corrections=True,
+                 check=lambda run, text: stop(run, text, "Stop button")),
+            dict(name="Escape key (real keystroke via SendInput)", text=LONG, wpm=120, corrections=True,
                  actions=[(25, self.press_escape)],
-                 check=lambda run, text: self.check_stopped(run, text, "Escape")),
-            dict(name="Focus moved to the source box", text=LONG, wpm=200, corrections=True,
+                 check=lambda run, text: stop(run, text, "Escape")),
+            dict(name="Focus moved to the source box", text=LONG, wpm=120, corrections=True,
                  actions=[(25, lambda: self.app.source.focus_set())],
-                 check=lambda run, text: self.check_stopped(run, text, "focus left the test editor")),
-            dict(name="Focus lost during the countdown", text=LONG, wpm=200, corrections=True,
+                 check=lambda run, text: stop(run, text, "focus left the test editor")),
+            dict(name="Focus lost during the countdown", text=LONG, wpm=120, corrections=True,
                  actions=[("countdown", lambda: self.app.source.focus_set())],
                  check=self.check_countdown_stop),
-            dict(name="Another application takes the foreground", text=LONG, wpm=200, corrections=True,
-                 actions=[(25, self.spawn_thief)], timeout=15000,
-                 check=lambda run, text: self.check_stopped(run, text, "another window became active")),
+            dict(name="Pick target: Notepad, typed and read back", text=NOTEPAD_TEXT, wpm=120,
+                 corrections=True, external=True, prepare=self.pick_notepad, check=self.check_notepad),
+            dict(name="Target Notepad: Escape (held 80 ms) stops typing", text=LONG, wpm=120,
+                 corrections=True, external=True, actions=[(25, lambda: hold_key(self.root, wi.VK_ESCAPE))],
+                 check=lambda run, text: stop(run, text, "Escape")),
+            dict(name="Target Notepad: minimising it stops typing", text=LONG, wpm=120, corrections=True,
+                 external=True, actions=[(25, lambda: _user32.ShowWindow(self.notepad_hwnd, 6))],
+                 check=lambda run, text: stop(run, text, "another window became active")),
+            dict(name="Another application takes the foreground", text=LONG, wpm=120, corrections=True,
+                 editor=True, actions=[(25, self.spawn_thief)], timeout=15000,
+                 check=lambda run, text: stop(run, text, "another window became active")),
         ]
 
     # Plumbing ------------------------------------------------------------------
@@ -140,8 +164,9 @@ class Harness:
         self.root.attributes("-topmost", True)
         self.root.after(300, self.acquire_foreground, time.perf_counter(), self.next_scenario)
         self.root.mainloop()
-        if self.thief and self.thief.poll() is None:
-            self.thief.terminate()
+        for proc in (self.thief, self.notepad):
+            if proc and proc.poll() is None:
+                proc.kill()  # Notepad: discard the test text without a save prompt
         return self.exit_code
 
     def acquire_foreground(self, t0: float, then) -> None:
@@ -149,9 +174,11 @@ class Harness:
             then()
             return
         if time.perf_counter() - t0 > 5:
-            print("SKIPPED: the test window could not get the foreground (locked or minimised session?)")
+            print(f"SKIPPED the remaining scenarios: the test window could not get the foreground "
+                  f"(now {describe_window(wi.foreground_window())})")
             self.exit_code = 2
-            self.root.destroy()
+            self.scenarios.clear()
+            self.finish()
             return
         self.root.deiconify()
         self.root.lift()
@@ -165,6 +192,8 @@ class Harness:
         sc = self.scenario = self.scenarios.pop(0)
         print(f"\n== {sc['name']}", flush=True)
         app = self.app
+        if sc.get("editor"):
+            app.use_test_editor()
         app.timing_log = self.timing_log if sc.get("log") else None
         app.source.delete("1.0", "end")
         app.source.insert("1.0", sc["text"])
@@ -174,10 +203,13 @@ class Harness:
         sc["pending"] = list(sc.get("actions", []))
         # Like a real paste: let the source box draw the text (Tk's first lookup of
         # fallback fonts for new emoji can take a few hundred ms) before Start.
-        self.root.after(800, self.press_start, sc)
+        if sc.get("prepare"):
+            self.root.after(800, sc["prepare"], lambda: self.press_start(sc))
+        else:
+            self.root.after(800, self.press_start, sc)
 
     def press_start(self, sc: dict) -> None:
-        if wi.foreground_window() != self.hwnd():
+        if not sc.get("external") and wi.foreground_window() != self.hwnd():
             self.root.after(10, self.acquire_foreground, time.perf_counter(), lambda: self.press_start(sc))
             return
         sc["t0"] = time.perf_counter()
@@ -212,27 +244,39 @@ class Harness:
     def timeout(self) -> None:
         self.app.stop("self-test timeout")
 
+    def target_text(self, run) -> str:
+        if run.target.external:
+            return autotyper.normalize_newlines(wi.read_control_text(run.target.focus) or "")
+        return self.app.editor.get("1.0", "end-1c")
+
     def _run_ended(self, run) -> None:
         if "another window" in run.outcome:
             print(f"  foreground is now {describe_window(wi.foreground_window())}", flush=True)
         if not run.clipboard_unchanged:  # read-only: who owns the clipboard now?
             print(f"  clipboard was changed by {describe_window(_user32.GetClipboardOwner() or 0)}", flush=True)
         self.root.after_cancel(self.scenario["guard"])
-        text_at_end = self.app.editor.get("1.0", "end-1c")
-        self.root.after(700, self.evaluate, run, text_at_end)
+
+        def snapshot():  # another app may still be processing the last keystroke
+            self.root.after(700, self.evaluate, run, self.target_text(run))
+        self.root.after(150 if run.target.external else 0, snapshot)
 
     def evaluate(self, run, text_at_end: str) -> None:
         print(f"  status: {self.app.status_text.get()}", flush=True)
         if self.app.detail_text.get():
             print(f"  report: {self.app.detail_text.get()}", flush=True)
-        self.check("no keystrokes arrive after the run ended",
-                   self.app.editor.get("1.0", "end-1c") == text_at_end)
+        self.check("no keystrokes arrive after the run ended", self.target_text(run) == text_at_end)
         self.check("clipboard untouched during the run", run.clipboard_unchanged)
-        self.scenario["check"](run, text_at_end)
-        if self.scenarios:
-            self.root.after(300, self.acquire_foreground, time.perf_counter(), self.next_scenario)
-        else:
+        try:
+            self.scenario["check"](run, text_at_end)
+        except Exception as exc:  # a broken run must fail its checks, not hang the harness
+            self.check(f"{self.scenario['name']}: checks could not be evaluated", False, repr(exc))
+        upcoming = self.scenarios[0] if self.scenarios else None
+        if upcoming is None:
             self.finish()
+        elif upcoming.get("external") and not upcoming.get("prepare"):
+            self.root.after(300, self.next_scenario)  # Notepad stays in front
+        else:
+            self.root.after(300, self.acquire_foreground, time.perf_counter(), self.next_scenario)
 
     def finish(self) -> None:
         self.check("clipboard sequence number unchanged across the whole self-test",
@@ -258,7 +302,7 @@ class Harness:
         x, y = scale.winfo_width() - 4, scale.winfo_height() // 2
         scale.event_generate("<ButtonPress-1>", x=x, y=y)
         scale.event_generate("<ButtonRelease-1>", x=x, y=y)
-        self.app.wpm_var.set(180)  # then "drag" it further, as a user would
+        self.app.wpm_var.set(150)  # then "drag" it further, as a user would
         self.app._on_speed()
 
     def press_escape(self) -> None:
@@ -281,6 +325,39 @@ class Harness:
         elif time.perf_counter() - t0 < 10:
             self.root.after(20, self.activate_thief, t0)
 
+    def pick_notepad(self, then) -> None:
+        """Open Notepad, press Pick target, then switch to Notepad as the user would."""
+        self.notepad = subprocess.Popen(["notepad.exe"])
+        self.editor_before = self.app.editor.get("1.0", "end-1c")
+        t0 = time.perf_counter()
+
+        def wait_window():
+            self.notepad_hwnd = find_window(self.notepad.pid, "Notepad")
+            if self.notepad_hwnd:
+                self.app.toggle_pick()
+                _user32.SetForegroundWindow(self.notepad_hwnd)  # = the user clicking into Notepad
+                wait_pick()
+            elif time.perf_counter() - t0 < 10:
+                self.root.after(50, wait_window)
+            else:
+                self.fail_scenario("Notepad did not open")
+
+        def wait_pick():
+            if self.app.target.external:
+                print(f"  picked: {self.app.target.describe()} (control {self.app.target.control})")
+                then()
+            elif self.app.picking:
+                self.root.after(50, wait_pick)
+            else:
+                self.fail_scenario(f"picking ended without a target: {self.app.status_text.get()}")
+
+        wait_window()
+
+    def fail_scenario(self, why: str) -> None:
+        self.check(self.scenario["name"], False, why)
+        self.scenarios = [s for s in self.scenarios if not s.get("external")]
+        self.root.after(300, self.acquire_foreground, time.perf_counter(), self.next_scenario)
+
     # Checks ----------------------------------------------------------------------
 
     def ratios(self, run, select) -> list[float]:
@@ -292,6 +369,10 @@ class Harness:
         self.check("final text matches the input exactly (incl. spaces, blank lines, Unicode)",
                    run.state == "done" and run.success and text == SAMPLE,
                    f"{len(text)} vs {len(SAMPLE)} code points")
+        minutes = (run.finished - run.started) / 60
+        wpm = run.pace.chars / 5 / minutes
+        self.check("overall speed (pauses and corrections included) matches the slider",
+                   abs(wpm - 90) <= 9, f"{wpm:.1f} WPM measured for 90 WPM; ordinary keys {base:.0f} ms apart")
 
         def in_range(kind: str, lo: float, hi: float) -> tuple[bool, str]:
             """Planned factors must all be in range; measured waits 97% (OS scheduling noise)."""
@@ -320,6 +401,9 @@ class Harness:
                    and statistics.fmean(paragraph) > statistics.fmean(sentence),
                    f"sentence {statistics.fmean(sentence):.1f}× (n={len(sentence)}), "
                    f"paragraph {statistics.fmean(paragraph):.1f}× (n={len(paragraph)})")
+        kinds = sorted({r.step.pause for r in run.records if r.step.pause})
+        self.check("human pauses occur (glances at the source, comma pauses, stalls …)",
+                   {"glance", "comma"} <= set(kinds), ", ".join(kinds))
         units = {r.step.text for r in run.records}
         combined = ("é", "👍🏽", FAMILY, "🇺🇸", "1️⃣")
         self.check("combined accents and multi-part emoji are sent as one timed unit",
@@ -348,7 +432,7 @@ class Harness:
                    f"'{self.beat_info[worst + 1]}'; gaps > 60 ms: {[round(g) for g in slow[:5]]}")
 
     def check_corrections_off(self, run, text: str) -> None:
-        self.check("exact text with corrections off", run.success and text == run.target)
+        self.check("exact text with corrections off", run.success and text == run.text)
         self.check("no Backspace or typo keystrokes when corrections are off",
                    not any(r.step.action == BACKSPACE or r.step.typo for r in run.records))
 
@@ -357,13 +441,28 @@ class Harness:
         self.check("moving the caret / selecting text mid-run does not corrupt the output",
                    run.success and text == MEDIUM)
         self.check("slider changes speed live without stealing focus", len(bases) >= 2 and run.success,
-                   f"base delays used: {bases} ms")
+                   f"base delays used: {bases[0]} … {bases[-1]} ms")
+
+    def check_notepad(self, run, text: str) -> None:
+        target = run.target
+        self.check("picked target is Notepad's text box",
+                   target.external and target.exe.lower() == "notepad.exe" and target.control == "Edit",
+                   f"{target.describe()}, control {target.control!r}")
+        self.check("Start asked before sending line breaks/tabs to another app",
+                   self.confirmations and self.confirmations[-1] == NOTEPAD_TEXT)
+        self.check("Notepad contains exactly the input (read back with WM_GETTEXT)",
+                   run.state == "done" and run.success is True and text == NOTEPAD_TEXT,
+                   run.outcome)
+        self.check("the auto-typer's own test editor was left alone",
+                   self.app.editor.get("1.0", "end-1c") == self.editor_before)
 
     def check_stopped(self, run, text: str, reason: str) -> None:
         self.check(f"run stopped because {reason}", run.state == "stopped" and reason in run.outcome,
                    run.outcome)
-        self.check("text typed so far is left visible in the editor",
-                   len(text) > 0 and text == run.expected, f"{len(text)} characters kept")
+        typed = autotyper.normalize_newlines(run.expected)
+        self.check("text typed so far is left visible in the target",
+                   len(typed) > 0 and (text.endswith(typed) if run.target.external else text == typed),
+                   f"{len(typed)} characters kept")
 
     def check_countdown_stop(self, run, text: str) -> None:
         self.check("focus change during the countdown stops before any keystroke",

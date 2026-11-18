@@ -8,11 +8,12 @@ import random
 import statistics
 import sys
 import unittest
+from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from typing_plan import (  # noqa: E402
-    BACKSPACE, BURST_RANGE, LETTER_RANGE, SLOW_RANGE, TYPE,
+    BACKSPACE, BURST_RANGE, LETTER_RANGE, SLOW_RANGE, TYPE, Pace,
     is_slow_unit, plan_typing, simulate, split_graphemes,
 )
 
@@ -169,6 +170,38 @@ class PlanTests(unittest.TestCase):
             fast.append(plan_typing("xthx", False, rng)[2].key_factor)  # "th": practised pair
             slow.append(plan_typing("xunx", False, rng)[2].key_factor)  # "un": same finger
         self.assertLess(statistics.fmean(fast) * 1.2, statistics.fmean(slow))
+
+    def test_pace_hits_the_requested_overall_wpm(self):
+        text = SAMPLE * 4
+        plan = plan_typing(text, True, random.Random(11))
+        pace = Pace.of(plan)
+        self.assertEqual(pace.chars, len(split_graphemes(text)))
+        for wpm in (25, 40, 70):
+            base = pace.base_ms(wpm)
+            total = sum(s.delay_ms(base) for s in plan)
+            self.assertAlmostEqual(total, pace.chars * 12_000 / wpm, delta=1)
+            self.assertLess(base, 12_000 / wpm)  # keys inside words run faster than the average
+
+    def test_paragraph_pause_is_never_replaced_by_a_word_pause(self):
+        for seed in range(300):
+            plan = plan_typing("Intro.\n\nextraordinarily long words", False, random.Random(seed))
+            self.assertEqual((plan[8].text, plan[8].pause), ("e", "paragraph"))
+
+    def test_copy_typing_pauses_occur(self):
+        text = "some words here and there, then more words follow. " * 40
+        kinds = Counter(s.pause for s in plan_typing(text, False, random.Random(12)) if s.pause)
+        self.assertGreater(kinds["glance"], 40)
+        for kind in ("stall", "comma", "sentence"):
+            self.assertIn(kind, kinds)
+
+    def test_warm_up_starts_slower(self):
+        first, later = [], []
+        for seed in range(200):
+            letters = [s.key_factor for s in plan_typing("lorem ipsum dolor sit amet " * 4, False,
+                                                         random.Random(seed)) if s.timing == "letter"]
+            first += letters[:4]
+            later += letters[40:60]
+        self.assertGreater(statistics.fmean(first), 1.1 * statistics.fmean(later))
 
     def test_sentence_comma_and_paragraph_pauses(self):
         plan = plan_typing("One. Two!\n\nThree\nfour, five", False, random.Random(8))

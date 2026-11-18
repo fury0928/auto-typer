@@ -6,11 +6,13 @@ multi-part emoji, or a single Backspace -- plus the wait before it. Waits are
 stored as multiples of the slider's base delay, so moving the slider mid-run
 takes effect on the next keystroke.
 
-The rhythm imitates a fluent typist: common letter pairs and double letters
-roll off quickly, same-finger pairs and Shift-capitals are slower, frequent
-short words come out in fast bursts, long words sometimes get a short
-hesitation, commas and sentence ends get pauses, and the overall tempo drifts
-gently. Symbols and non-ASCII characters always take 1.5-2.5x the base delay.
+The rhythm imitates a person copy-typing: a slower warm-up, common letter pairs
+and double letters rolling off quickly, same-finger pairs, rare letters, digits
+and Shift-capitals slower, frequent short words in fast bursts, a glance back at
+the source every few words, momentary stalls, now and then a longer pause,
+pauses after commas, sentences and paragraphs, and a gently drifting tempo.
+Symbols and non-ASCII characters always take 1.5-2.5x the base delay.
+Pace.base_ms() picks the base delay so the whole run averages the chosen WPM.
 
 simulate() replays a plan on a plain buffer; the unit tests use it to prove that
 every plan ends with exactly the source text, typos and all.
@@ -33,9 +35,13 @@ SLOW_RANGE = (1.5, 2.5)       # symbols and every non-ASCII grapheme
 BACKSPACE_RANGE = (0.45, 0.8)
 BURST_CHANCE = 0.06           # chance that any other word starts a fast burst ...
 BURST_KEYS = (3, 7)           # ... lasting this many keystrokes
-COMMON_WORD_BURST = 0.6       # chance a very common word is typed as one fast burst
+COMMON_WORD_BURST = 0.5       # chance a very common word is typed as one fast burst
 HESITATE_CHANCE = 0.2         # chance of a short hesitation before a long word ...
 HESITATE_MIN_LETTERS = 8      # ... of at least this many letters
+GLANCE_WORDS = (3, 7)         # words typed between glances back at the source
+THINK_CHANCE = 0.006          # chance per word of a longer "lost my place" pause
+STALL_CHANCE = 0.03           # chance per mid-word letter of a momentary stall
+WARMUP_KEYS = 20              # the first keystrokes are up to 30% slower
 TEMPO_RANGE = (0.85, 1.15)    # slow drift of the typist's overall pace
 
 # Extra pauses added on top of the key delay:
@@ -46,6 +52,9 @@ PAUSES = {
     "line": (1.5, 3.0, 0, 0),            # first key after a single line break
     "comma": (0.5, 1.4, 0, 100),         # whitespace after , ; :
     "word": (0.8, 2.0, 0, 120),          # hesitation before a long word
+    "glance": (0.8, 2.0, 150, 450),      # look back at the source every few words
+    "think": (3.0, 6.0, 600, 1500),      # rare longer pause
+    "stall": (0.3, 1.0, 0, 60),          # momentary hesitation on a key
     "notice": (2.0, 3.5, 120, 300),      # typo stays on screen, then Backspace
     "resume": (0.5, 1.2, 0, 0),          # after erasing, before retyping
 }
@@ -74,6 +83,8 @@ COMMON_WORDS = frozenset(
     "make like him into has more go see no way could my than been who its now".split()
 )
 
+RARE_LETTERS = frozenset("qzxjkv")
+
 ZWJ = "‍"
 _KEY_ROWS = ("qwertyuiop", "asdfghjkl", "zxcvbnm")
 # Touch-typing finger for each letter (0-3 left hand pinky..index, 4-7 right hand index..pinky).
@@ -96,6 +107,32 @@ class Step:
 
     def delay_ms(self, base_ms: float) -> float:
         return (self.key_factor + self.pause_factor) * base_ms + self.pause_ms
+
+
+@dataclass(frozen=True)
+class Pace:
+    """Totals of a plan, used to turn an overall WPM into the base delay."""
+
+    chars: int        # source characters (grapheme clusters) the plan types
+    factors: float    # sum of key and pause factors over all steps
+    fixed_ms: float   # sum of fixed pause milliseconds
+
+    @classmethod
+    def of(cls, steps: list[Step]) -> Pace:
+        return cls(
+            chars=sum(1 for s in steps if s.action == TYPE and not s.typo),
+            factors=sum(s.key_factor + s.pause_factor for s in steps),
+            fixed_ms=sum(s.pause_ms for s in steps),
+        )
+
+    def base_ms(self, wpm: float) -> float:
+        """Base delay that makes the whole plan -- pauses and corrections included --
+        take as long as typing it at `wpm` (standard 5 characters per word)."""
+        per_char = 12_000 / wpm
+        if not self.chars or not self.factors:
+            return per_char
+        base = (self.chars * per_char - self.fixed_ms) / self.factors
+        return max(base, 0.25 * per_char)  # very high WPM with many pauses: best effort
 
 
 # --- grapheme clusters --------------------------------------------------------
@@ -234,6 +271,8 @@ class _Planner:
         self.typo_gap = 0
         self.tempo = 1.0
         self.prev_key = ""  # previous keystroke, for finger/bigram timing
+        self.keys_typed = 0
+        self.words_until_glance = rng.randint(*GLANCE_WORDS)
 
     def plan(self) -> list[Step]:
         i = 0
@@ -242,8 +281,13 @@ class _Planner:
             pause = self._pause_before(i)
             if pause:
                 self.burst_left = 0
+                if pause[0] in ("sentence", "line", "paragraph"):  # these double as a glance
+                    self.words_until_glance = self.rng.randint(*GLANCE_WORDS)
             if pause is None or pause[0] in ("line", "paragraph"):
-                pause = self._word_start(i) or pause
+                word_pause = self._word_start(i)  # may also start a burst
+                pause = pause or word_pause
+            if pause is None and self._stalls(i):
+                pause = self._pause("stall")
             consumed = 0 if pause else self._maybe_typo(i)
             if consumed:
                 i += consumed
@@ -284,20 +328,37 @@ class _Planner:
         return None
 
     def _word_start(self, i: int):
-        """At the first letter of a word: maybe burst through it, maybe hesitate first."""
+        """At the first letter of a word: maybe burst through it, maybe pause first.
+
+        Copy-typists glance back at the source every few words, now and then lose
+        their place for a moment, and slow down before long words.
+        """
         units = self.units
-        if not _is_letter(units[i]) or (i > 0 and not units[i - 1].isspace()):
+        if not units[i].isalnum() or (i > 0 and not units[i - 1].isspace()):
             return None
         word = _word_at(units, i)
-        if self.burst_left == 0:
+        if self.burst_left == 0 and word:
             if word.lower() in COMMON_WORDS and self.rng.random() < COMMON_WORD_BURST:
                 self.burst_left = len(word) + 1  # the word and the space after it
             elif self.rng.random() < BURST_CHANCE:
                 self.burst_left = self.rng.randint(*BURST_KEYS)
-        if len(word) >= HESITATE_MIN_LETTERS and self.rng.random() < HESITATE_CHANCE:
+        self.words_until_glance -= 1
+        if self.rng.random() < THINK_CHANCE:
+            pause = self._pause("think")
+        elif self.words_until_glance <= 0:
+            pause = self._pause("glance")  # a burst may follow: the chunk just read
+        elif len(word) >= HESITATE_MIN_LETTERS and self.rng.random() < HESITATE_CHANCE:
             self.burst_left = 0
             return self._pause("word")
-        return None
+        else:
+            return None
+        self.words_until_glance = self.rng.randint(*GLANCE_WORDS)
+        return pause
+
+    def _stalls(self, i: int) -> bool:
+        units = self.units
+        return (i > 0 and _is_letter(units[i]) and _is_letter(units[i - 1])
+                and self.rng.random() < STALL_CHANCE)
 
     def _key_timing(self, unit: str) -> tuple[float, str]:
         if is_slow_unit(unit):
@@ -319,8 +380,14 @@ class _Planner:
                 factor *= 0.92                           # hands alternate
         elif prev.isspace() and _is_letter(cur):
             factor *= self.rng.uniform(1.05, 1.2)        # first letter of a word
+        if unit == " " and _is_letter(prev):
+            factor *= self.rng.uniform(0.8, 1.0)         # quick thumb on the space bar
+        if cur in RARE_LETTERS or unit.isdigit():
+            factor *= self.rng.uniform(1.05, 1.25)       # unfamiliar reach
         if unit.isupper():
             factor *= self.rng.uniform(1.15, 1.35)       # reach for Shift
+        if self.keys_typed < WARMUP_KEYS:
+            factor *= 1 + 0.3 * (1 - self.keys_typed / WARMUP_KEYS)  # warming up
         return min(max(factor, LETTER_RANGE[0]), LETTER_RANGE[1]), "letter"
 
     # Steps -------------------------------------------------------------------
@@ -330,6 +397,7 @@ class _Planner:
         name, pause_factor, pause_ms = pause or ("", 0.0, 0.0)
         self.steps.append(Step(TYPE, unit, factor, timing, name, pause_factor, pause_ms, typo))
         self.prev_key = unit
+        self.keys_typed += 1
 
     def _backspace(self, pause=None) -> None:
         name, pause_factor, pause_ms = pause or ("", 0.0, 0.0)

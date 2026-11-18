@@ -141,6 +141,145 @@ def held_modifiers() -> list[str]:
     return names
 
 
+def mouse_button_down() -> bool:
+    """Any physical mouse button held (left, right, middle)."""
+    return any(key_down(vk) for vk in (0x01, 0x02, 0x04))
+
+
+# --- other windows (the "Pick target" feature) ---------------------------------
+
+class GUITHREADINFO(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("flags", wintypes.DWORD),
+                ("hwndActive", wintypes.HWND), ("hwndFocus", wintypes.HWND),
+                ("hwndCapture", wintypes.HWND), ("hwndMenuOwner", wintypes.HWND),
+                ("hwndMoveSize", wintypes.HWND), ("hwndCaret", wintypes.HWND),
+                ("rcCaret", wintypes.RECT)]
+
+
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+user32.GetGUIThreadInfo.argtypes = (wintypes.DWORD, ctypes.POINTER(GUITHREADINFO))
+user32.GetWindowThreadProcessId.argtypes = (wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.IsWindow.argtypes = (wintypes.HWND,)
+user32.IsIconic.argtypes = (wintypes.HWND,)
+user32.ShowWindow.argtypes = (wintypes.HWND, ctypes.c_int)
+user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+user32.SetFocus.argtypes = (wintypes.HWND,)
+user32.AttachThreadInput.argtypes = (wintypes.DWORD, wintypes.DWORD, wintypes.BOOL)
+user32.GetWindowTextW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+user32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT)
+user32.SendMessageTimeoutW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                                       wintypes.UINT, wintypes.UINT, ctypes.POINTER(ULONG_PTR))
+user32.SendMessageTimeoutW.restype = wintypes.LPARAM
+kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+kernel32.QueryFullProcessImageNameW.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                ctypes.POINTER(wintypes.DWORD))
+
+# Desktop, taskbar, Start menu, Alt+Tab switcher and the like are never typing targets.
+SHELL_CLASSES = frozenset({
+    "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "Progman", "WorkerW", "TaskListThumbnailWnd",
+    "MultitaskingViewFrame", "XamlExplorerHostIslandWindow", "ForegroundStaging",
+    "Windows.UI.Core.CoreWindow", "NotifyIconOverflowWindow", "TopLevelWindowForOverflowXamlIsland",
+})
+
+
+def focused_control() -> int:
+    """The window that has keyboard focus in the foreground app (0 if unknown)."""
+    info = GUITHREADINFO(cbSize=ctypes.sizeof(GUITHREADINFO))
+    if not user32.GetGUIThreadInfo(0, ctypes.byref(info)):
+        return 0
+    return info.hwndFocus or 0
+
+
+def window_thread_process(hwnd: int) -> tuple[int, int]:
+    pid = wintypes.DWORD()
+    tid = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return tid, pid.value
+
+
+def is_window(hwnd: int) -> bool:
+    return bool(hwnd) and bool(user32.IsWindow(hwnd))
+
+
+def window_title(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, buf, 512)
+    return buf.value
+
+
+def class_name(hwnd: int) -> str:
+    buf = ctypes.create_unicode_buffer(256)
+    user32.GetClassNameW(hwnd, buf, 256)
+    return buf.value
+
+
+def process_name(pid: int) -> str:
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return "?"
+    try:
+        buf, size = ctypes.create_unicode_buffer(1024), wintypes.DWORD(1024)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return buf.value.rsplit("\\", 1)[-1]
+        return "?"
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def is_shell_window(hwnd: int) -> bool:
+    return class_name(hwnd) in SHELL_CLASSES
+
+
+def activate_window(hwnd: int, focus: int) -> None:
+    """Bring another app's window to the front and put keyboard focus back on `focus`.
+
+    Windows allows this because the caller is the foreground app (the user just
+    pressed Start). Most apps restore their own focus on activation; for the
+    rest, SetFocus is called with the target thread's input attached.
+    """
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    if focus and focused_control() != focus and is_window(focus):
+        target_thread, _ = window_thread_process(focus)
+        own_thread = kernel32.GetCurrentThreadId()
+        if user32.AttachThreadInput(own_thread, target_thread, True):
+            try:
+                user32.SetFocus(focus)
+            finally:
+                user32.AttachThreadInput(own_thread, target_thread, False)
+
+
+def raise_without_activating(hwnd: int) -> None:
+    """Show a window above others without taking focus from the active app."""
+    flags = 0x0001 | 0x0002 | 0x0010  # SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE
+    user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, flags)  # HWND_TOPMOST
+    user32.SetWindowPos(hwnd, -2, 0, 0, 0, 0, flags)  # HWND_NOTOPMOST
+
+
+def read_control_text(hwnd: int) -> str | None:
+    """Text of a standard Edit/RichEdit control, or None if it can't be read.
+
+    Only used to verify a finished run; browsers and most modern apps draw their
+    own text boxes, which this cannot read.
+    """
+    if not is_window(hwnd) or "edit" not in class_name(hwnd).lower():
+        return None
+    result = ULONG_PTR()
+    flags = 0x0002  # SMTO_ABORTIFHUNG
+    if not user32.SendMessageTimeoutW(hwnd, 0x000E, 0, 0, flags, 1000, ctypes.byref(result)):  # WM_GETTEXTLENGTH
+        return None
+    buf = ctypes.create_unicode_buffer(result.value + 1)
+    if not user32.SendMessageTimeoutW(hwnd, 0x000D, len(buf), ctypes.addressof(buf), flags, 1000,  # WM_GETTEXT
+                                      ctypes.byref(result)):
+        return None
+    return buf.value
+
+
 def clipboard_sequence_number() -> int:
     """Read-only counter that Windows bumps whenever the clipboard contents change."""
     return user32.GetClipboardSequenceNumber()
