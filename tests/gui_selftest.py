@@ -111,6 +111,8 @@ class Harness:
         self.notepad: subprocess.Popen | None = None
         self.notepad_hwnd = 0
         self.editor_before = ""
+        self.paused_at = 0
+        self.typed_while_paused = -1
         self.scenario: dict | None = None
         self.beats: list[float] = []
         self.beat_info: list[str] = []
@@ -123,6 +125,8 @@ class Harness:
                  corrections=False, check=self.check_corrections_off),
             dict(name="Caret moved and slider dragged mid-run", text=MEDIUM, wpm=80, corrections=True,
                  actions=[(15, self.move_caret), (30, self.click_slider)], check=self.check_interference),
+            dict(name="Pause, wait 1 s, Resume", text=MEDIUM, wpm=120, corrections=True,
+                 actions=[(15, self.pause_then_resume)], check=self.check_pause_resume),
             dict(name="Stop button", text=LONG, wpm=120, corrections=True,
                  actions=[(25, lambda: self.app.stop_button.invoke())],
                  check=lambda run, text: stop(run, text, "Stop button")),
@@ -292,8 +296,16 @@ class Harness:
     # Scenario actions ------------------------------------------------------------
 
     def move_caret(self) -> None:
-        """What a stray click inside the editor does: caret to the start plus a selection."""
-        editor = self.app.editor
+        """What a stray click inside the editor does: caret to the start plus a selection.
+
+        A real click is queued behind keystrokes already sent, so wait until the
+        editor has processed them; moving the caret directly in between would
+        create a race that cannot happen with a real mouse.
+        """
+        editor, run = self.app.editor, self.app.run
+        if run and run.active and editor.get("1.0", "end-1c") != run.expected:
+            self.root.after(2, self.move_caret)
+            return
         editor.mark_set("insert", "1.0")
         editor.tag_add("sel", "1.0", "1.4")
 
@@ -304,6 +316,15 @@ class Harness:
         scale.event_generate("<ButtonRelease-1>", x=x, y=y)
         self.app.wpm_var.set(150)  # then "drag" it further, as a user would
         self.app._on_speed()
+
+    def pause_then_resume(self) -> None:
+        self.app.toggle_pause()
+        self.paused_at = self.app.run.index
+
+        def resume():
+            self.typed_while_paused = self.app.run.index - self.paused_at
+            self.app.toggle_pause()
+        self.root.after(1000, resume)
 
     def press_escape(self) -> None:
         if wi.foreground_window() == self.hwnd():  # never inject into another window
@@ -443,6 +464,15 @@ class Harness:
         self.check("slider changes speed live without stealing focus", len(bases) >= 2 and run.success,
                    f"base delays used: {bases[0]} … {bases[-1]} ms")
 
+    def check_pause_resume(self, run, text: str) -> None:
+        after = next((r for r in run.records if r.index == self.paused_at), None)
+        self.check("nothing is typed while paused, and the text is exact after Resume",
+                   self.typed_while_paused == 0 and run.success and text == MEDIUM,
+                   f"{self.typed_while_paused} keys while paused")
+        self.check("first gap after Resume is timed from the Resume, not across the pause",
+                   after is not None and abs(after.actual_ms - after.planned_ms) < 30,
+                   f"{after.actual_ms:.0f} ms measured vs {after.planned_ms:.0f} ms planned" if after else "")
+
     def check_notepad(self, run, text: str) -> None:
         target = run.target
         self.check("picked target is Notepad's text box",
@@ -473,4 +503,9 @@ class Harness:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timing-log", help="CSV path for the full run's per-keystroke timings")
-    sys.exit(Harness(parser.parse_args().timing_log).main())
+    parser.add_argument("--only", help="run only scenarios whose name contains this text")
+    args = parser.parse_args()
+    harness = Harness(args.timing_log)
+    if args.only:
+        harness.scenarios = [s for s in harness.scenarios if args.only.lower() in s["name"].lower()]
+    sys.exit(harness.main())

@@ -37,9 +37,9 @@ py autotyper.py
 
 1. Type or paste (Ctrl+V) your text into **Source text**.
 2. Set **Speed**. It is the *overall* typing speed, including every pause and
-   correction, so 40 WPM (the default, about an average adult) really finishes
-   at 40 WPM. Keys inside words therefore come faster than the average, about
-   160 ms apart at 40 WPM, just as with a real typist. You can move the slider
+   correction, so 65 WPM (the default) really finishes at 65 WPM. Keys inside
+   words therefore come faster than the average, about 155 ms apart at 65 WPM,
+   just as with a real typist. You can move the slider
    during a run and the change applies from the next keystroke.
 3. Leave **Show typing corrections** on (the default) for visible typos and fixes.
 4. Choose where to type:
@@ -51,7 +51,10 @@ py autotyper.py
 5. Press **Start**. The app snapshots the source text and counts down for
    2 seconds, then types. With an external target it first brings that window
    to the front.
-6. To stop, press **Esc** (this works in any window), click **Stop**, or move
+6. **Pause** halts typing without ending the run; **Resume** continues from the
+   same keystroke (with an external target, it brings that window back to the
+   front first). Stop works while paused too.
+7. To stop, press **Esc** (this works in any window), click **Stop**, or move
    focus anywhere else. With an external target, any mouse click also stops
    it. Whatever has already been typed stays where it is.
 
@@ -67,9 +70,9 @@ app works it out from the slider so the whole run averages the chosen WPM
 
 | Keystroke | Wait before it |
 | --- | --- |
-| Ordinary letters, digits, space, `. , ; : ! ? ' " - ( )` | 0.5–1.45×. Log-normal jitter, with a slower warm-up for the first ~20 keys; common pairs (th, he, in…) and double letters faster; same-finger pairs, rare letters (q z x j k v), digits and Shift-capitals slower; a quick thumb on the space bar; and a gently drifting tempo |
+| Ordinary letters, digits, space, `. , ; : ! ? ' " -` | 0.5–1.45×. Log-normal jitter, with a slower warm-up for the first ~20 keys; common pairs (th, he, in…) and double letters faster; same-finger pairs, rare letters (q z x j k v), digits and Shift-capitals slower; a quick thumb on the space bar; and a gently drifting tempo |
 | Fast bursts (frequent short words like *the*, *and*, *of*, plus random 3–7 key runs) | 0.35–0.6× |
-| Symbols `@ # $ % ^ & * + = _ ~ \` \| \ / < > [ ] { }` and **any non-ASCII** character (é, 😊, 中, €…) | **1.5–2.5×** |
+| Symbols `@ # $ % ^ & * + = _ ~ \` \| \ / < > ( ) [ ] { }` and **any non-ASCII** character (é, ±, 😊, 中, €…) | **1.5–2.5×** |
 | Every 3–7 words: a glance back at the source | + 0.8–2× + 150–450 ms |
 | Before some long words (8+ letters) | + 0.8–2× hesitation |
 | Momentary stall on a letter (3%) | + 0.3–1× |
@@ -171,15 +174,16 @@ Run `py autotyper.py` and work through these checks.
 - [ ] **Clipboard preservation.** In Notepad, copy `CLIPBOARD-SENTINEL-123`. Run a
   full text, stopping one run halfway through. The status line should say
   *Clipboard untouched*, and pasting should still give the sentinel.
-- [ ] **Overall speed.** At 40 WPM, a 400-character text should take about
-  2 minutes (400 ÷ 5 ÷ 40 = 2.0 minutes). The status line shows the estimate
+- [ ] **Overall speed.** At 65 WPM, a 650-character text should take about
+  2 minutes (650 ÷ 5 ÷ 65 = 2.0 minutes). The status line shows the estimate
   before typing starts.
 
 ## Automated checks
 
 ```powershell
 py -m unittest discover -s tests -v   # 19 planner tests, any OS, ~6 s
-py tests\gui_selftest.py              # end-to-end with real SendInput + classic Notepad, ~2.5 min
+py tests\gui_selftest.py              # end-to-end with real SendInput + classic Notepad, ~3 min
+py tests\gui_selftest.py --only pause # just the scenarios whose name contains "pause"
 ```
 
 The self-test needs an unlocked desktop in front (not a minimized remote-desktop
@@ -193,14 +197,13 @@ Windows 11 24H2), over RDP, Python 3.12.10, Tk 8.6.15.
 
 | Check | Result |
 | --- | --- |
-| Unit tests (19): grapheme splitting; 9 000 random plans reproduce their input; Backspace only erases typo letters; all five typo kinds; overall-WPM calibration; paragraph pause never replaced; copy-typing pauses; warm-up; symbol and Unicode 1.5–2.5×; bursts; bigrams; sentence, comma and paragraph pauses | 19/19 pass |
-| GUI self-test, run before the target picker and overall-WPM changes: exact text with corrections on/off; symbol and Unicode waits 1.68–2.50×; typos visible; p95 scheduling error 1.2 ms; worst UI stall 45 ms; Stop, Esc, focus loss, countdown focus loss and another app taking the foreground all stop with text kept; clipboard unchanged | 39/39 pass |
-| GUI self-test after adding the target picker | **Not run.** The session had no foreground window (remote desktop minimized or locked), so the harness correctly skipped. |
-| Smoke test of the new code with no foreground window: a run starts and stops cleanly during the countdown; picking starts and cancels; a real other window (VS Code) works as a `WindowTarget` | pass |
+| Unit tests (19): grapheme splitting; 9 000 random plans reproduce their input; Backspace only erases typo letters; all five typo kinds; overall-WPM calibration; paragraph pause never replaced; copy-typing pauses; warm-up; ~80 symbols and special characters classified slow; bursts; bigrams; sentence, comma and paragraph pauses | 19/19 pass |
+| GUI self-test, test editor: exact text with corrections on and off; overall speed 89.4 WPM for a 90 WPM setting; symbol and Unicode waits 1.55–2.38×; typos shown, then erased and retyped; p95 scheduling error 1.6 ms; worst UI stall 53 ms; Pause → 1 s → Resume types nothing while paused and stays exact; Stop, Esc, focus loss, countdown focus loss and another app taking the foreground all stop with text kept; clipboard unchanged | pass |
+| GUI self-test, picked target (classic Notepad): picked the Edit control; Start asked about line breaks and tabs; text read back exactly; a held Esc and minimizing Notepad both stop the run with text kept; the test editor was left alone | pass |
+| Totals | 57/59 in the full run. The 2 failures were a race in the harness's simulated caret click, not the app; after fixing the harness that scenario passed 5/5. |
 
-Not yet verified: the new external-target scenarios in `tests/gui_selftest.py`
-(Notepad read-back, held Esc, minimizing the target), a real browser target,
-retail Windows 10 or 11, high-DPI scaling, and non-US keyboard layouts or IMEs.
+Not yet verified: a real browser target, retail Windows 10 or 11, high-DPI
+scaling, and non-US keyboard layouts or IMEs.
 
 ## Limitations
 

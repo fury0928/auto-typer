@@ -64,9 +64,10 @@ TYPO_GAP = (10, 25)           # keystroke units between two typos
 TYPO_KINDS = ("neighbor", "swap", "skip", "double", "shift")
 TYPO_WEIGHTS = {"neighbor": 40, "swap": 25, "skip": 15, "double": 12, "shift": 8}
 
-# ASCII punctuation typed at ordinary speed. Every other printable ASCII symbol
-# (@ # $ % ^ & * + = _ ~ ` | \ / < > [ ] { }) is a slow symbol.
-PROSE_PUNCTUATION = frozenset(".,;:!?'\"-()")
+# The only symbols typed at ordinary speed: frequent, unshifted prose punctuation.
+# Every other printable ASCII symbol -- including the shifted : ! ? " and all
+# brackets -- is a slow symbol, like every non-ASCII character.
+PROSE_PUNCTUATION = frozenset(".,;'-")
 SENTENCE_ENDS = frozenset(".!?…")
 CLAUSE_ENDS = frozenset(",;:")
 CLOSERS = frozenset("\"')]}”’»")

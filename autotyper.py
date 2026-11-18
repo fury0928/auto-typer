@@ -43,7 +43,7 @@ ACTIVATE_SETTLE_S = 0.25  # let another app finish activating before the first k
 READBACK_TIMEOUT_S = 1.5  # wait for another app to process the last keystrokes
 PICK_TIMEOUT_S = 20
 PICK_SETTLE_S = 0.6       # the picked window must stay in front this long
-WPM_MIN, WPM_MAX, WPM_DEFAULT = 10, 150, 40  # overall speed; ~40 WPM is an average adult
+WPM_MIN, WPM_MAX, WPM_DEFAULT = 10, 150, 65  # overall speed, pauses and corrections included
 
 ACCENT = "#0067c0"
 SUCCESS = "#0f7b0f"
@@ -266,7 +266,7 @@ class TypingRun:
 
     @property
     def active(self) -> bool:
-        return self.state in ("countdown", "typing", "finishing")
+        return self.state in ("countdown", "typing", "finishing", "paused")
 
     @property
     def sending(self) -> bool:
@@ -448,6 +448,36 @@ class TypingRun:
             message = f"Finished, but the text box in {where} does not contain the exact input."
         self._end("done", message)
 
+    def pause(self) -> None:
+        if self.state != "typing":
+            return
+        self.state = "paused"
+        for attr in ("after_id", "watch_id"):
+            pending = getattr(self, attr)
+            if pending is not None:
+                self.app.root.after_cancel(pending)
+                setattr(self, attr, None)
+        self.app.on_paused(self)
+
+    def resume(self) -> None:
+        if self.state != "paused":
+            return
+        self.state = "typing"
+        now = time.perf_counter()
+        if self.target.external:
+            self.target.activate()
+            self.settled_at = now + ACTIVATE_SETTLE_S
+        else:
+            self.app.editor.focus_set()
+            self.settled_at = now
+        # Measure the next gap from the resume, not across the whole pause.
+        self.last_sent = self.settled_at
+        self.sync_since = None
+        self._schedule_next(self.last_sent)
+        self.app.on_resumed(self)
+        self._watch()
+        self._tick()
+
     def stop(self, reason: str) -> None:
         if not self.active:
             return
@@ -539,10 +569,15 @@ class AutoTyperApp:
         self.corrections_check.grid(row=0, column=3, sticky="w")
         self.start_button = ttk.Button(controls, text="Start", width=10, command=self.start)
         self.start_button.grid(row=0, column=4, padx=(8, 6))
-        # takefocus=False: clicking Stop must not pull focus out of the editor first.
+        # takefocus=False: clicking Pause/Stop must not pull focus out of the editor first
+        # (that would be read as a focus change and stop the run before the click is handled).
+        self.pause_button = ttk.Button(controls, text="Pause", width=10, takefocus=False,
+                                       command=self.toggle_pause)
+        self.pause_button.grid(row=0, column=5, padx=(0, 6))
+        self.pause_button.state(["disabled"])
         self.stop_button = ttk.Button(controls, text="Stop", width=10, takefocus=False,
                                       command=lambda: self.stop("the Stop button was clicked"))
-        self.stop_button.grid(row=0, column=5)
+        self.stop_button.grid(row=0, column=6)
         self.stop_button.state(["disabled"])
 
         target_row = ttk.Frame(outer)
@@ -621,6 +656,9 @@ class AutoTyperApp:
         self.pick_button.state(on if idle else off)
         self.editor_button.state(on if idle and self.target.external else off)
         self.stop_button.state(off if idle else on)
+        self.pause_button.state(off if idle else on)
+        if idle:
+            self.pause_button.configure(text="Pause")
 
     # Target picking ------------------------------------------------------------
 
@@ -741,6 +779,14 @@ class AutoTyperApp:
         if self.run and self.run.active:
             self.run.stop(reason)
 
+    def toggle_pause(self) -> None:
+        if not self.run:
+            return
+        if self.run.state == "typing":
+            self.run.pause()
+        elif self.run.state == "paused":
+            self.run.resume()
+
     def _on_escape(self, _event=None):
         if self.picking:
             self._end_pick("Target picking cancelled.")
@@ -765,6 +811,18 @@ class AutoTyperApp:
     def on_typing_started(self, run: TypingRun) -> None:
         where = f" into {run.target.name()}" if run.target.external else ""
         self._set_badge(f"● Typing{where} (Esc to stop)")
+
+    def on_paused(self, run: TypingRun) -> None:
+        self.pause_button.configure(text="Resume")
+        self._set_badge("⏸ Paused", WARNING)
+        self.status_text.set(f"Paused at keystroke {run.index} of {len(run.steps)}. "
+                             f"Press Resume to continue or Stop to end.")
+
+    def on_resumed(self, run: TypingRun) -> None:
+        self.pause_button.configure(text="Pause")
+        self.on_typing_started(run)
+        where = f" into {run.target.name()}" if run.target.external else ""
+        self.status_text.set(f"Resuming{where}…")
 
     def on_step(self, run: TypingRun, rec: TimingRecord) -> None:
         step = rec.step

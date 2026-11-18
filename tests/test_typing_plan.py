@@ -133,10 +133,13 @@ class PlanTests(unittest.TestCase):
                     self.assertTrue(BURST_RANGE[0] <= step.key_factor <= LETTER_RANGE[1])
 
     def test_slow_unit_classification(self):
-        for unit in ("@", "#", "%", "+", "=", "&", "é", "é", "😊", FAMILY, "€", " "):
-            self.assertTrue(is_slow_unit(unit), unit)
-        for unit in ("a", "Z", "7", " ", "\n", "\t", ".", ",", "?", "!", "'", "-"):
-            self.assertFalse(is_slow_unit(unit), unit)
+        ascii_symbols = "@#$%^&*+=_~`|\\/<>()[]{}:!?\""
+        special = ("±×÷°µ€£¥¢©®™§¶•…→←↑↓↔≤≥≠≈∞√∑∏∫∂πΩαβ½¼¾¹²³¿¡«»“”‘’–—"
+                   "  ​")
+        for unit in list(ascii_symbols) + list(special) + ["é", "é", "😊", FAMILY, "中", "🇺🇸"]:
+            self.assertTrue(is_slow_unit(unit), repr(unit))
+        for unit in ("a", "Z", "7", " ", "\n", "\t", ".", ",", ";", "'", "-"):
+            self.assertFalse(is_slow_unit(unit), repr(unit))
 
     def test_other_typo_kinds_are_fixed_too(self):
         cases = {
