@@ -1,4 +1,4 @@
-# Auto-Typer
+# Typing Tester (auto-typer)
 
 A Windows 10/11 auto-typer written in Python with Tkinter. It types the text in its
 **Source** box like a person copy-typing it. It types into either its own

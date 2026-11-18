@@ -500,7 +500,7 @@ class AutoTyperApp:
 
     def _build_ui(self) -> None:
         root = self.root
-        root.title("Auto-Typer")
+        root.title("Typing Tester")
         scale = max(1.0, root.winfo_fpixels("1i") / 96)  # follow Windows display scaling
         root.geometry(f"{int(940 * scale)}x{int(760 * scale)}")
         root.minsize(int(800 * scale), int(580 * scale))
@@ -689,7 +689,7 @@ class AutoTyperApp:
         if not keys:
             return True
         return messagebox.askyesno(
-            "Auto-Typer",
+            "Typing Tester",
             f"The text contains {' and '.join(keys)}.\n\n"
             "In a single-line box Enter usually submits the form, and in most browser text "
             "boxes Tab jumps to the next field instead of typing a tab.\n\n"
